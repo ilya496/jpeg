@@ -1,0 +1,35 @@
+# Ignore compiled binaries
+decoder
+decoder.exe
+
+# Ignore object files
+*.o
+*.obj
+
+# Ignore build folders
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Ignore Visual Studio files (if shared across OS)
+*.vcxproj*
+*.sln
+*.user
+*.log
+x64/
+
+# Ignore macOS or Linux system files
+.DS_Store
+Thumbs.db
+
+# Ignore core dumps
+core
+*.core
+
+# Ignore temporary files and editor backups
+*~
+*.swp
+*.tmp
+*.bak
