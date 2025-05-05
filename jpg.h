@@ -107,6 +107,7 @@ struct ColorComponent {
 struct HuffmanTable {
 	byte offsets[17] = { 0 };
 	byte symbols[162] = { 0 };
+	uint32_t codes[162] = { 0 };
 	bool set = false;
 };
 
@@ -133,6 +134,36 @@ struct Header {
 	std::vector<byte> huffmanData;
 
 	bool isValid = true;
+};
+
+struct MCU {
+	union {
+		int y[64] = { 0 };
+		int r[64];
+	};
+
+	union {
+		int cb[64] = { 0 };
+		int g[64];
+	};
+
+	union {
+		int cr[64] = { 0 };
+		int b[64];
+	};
+
+	int* operator[](uint32_t i) {
+		switch (i) {
+		case 0:
+			return y;
+		case 1:
+			return cb;
+		case 2: 
+			return cr;
+		default:
+			return nullptr;
+		}
+	}
 };
 
 const byte zigZagMap[] = {

@@ -304,7 +304,7 @@ Header* readJPG(const std::string& filename) {
 
 	Header* header = new (std::nothrow) Header();
 	if (header == nullptr) {
-		std::cout << "Error - Memory error while instantiating header\n";
+		std::cout << "Error - Memory error\n";
 		file.close();
 		return nullptr;
 	}
@@ -556,6 +556,297 @@ void printHeader(const Header* const header) {
 	std::cout << "Restart Interval: " << header->restartInterval << '\n';
 }
 
+// generate all Huffman codes based on symbols from a Huffman table
+void generateCodes(HuffmanTable& hTable) {
+	uint32_t code = 0;
+	for (uint32_t i = 0; i < 16; ++i) {
+		for (uint32_t j = hTable.offsets[i]; j < hTable.offsets[i + 1]; ++j) {
+			hTable.codes[j] = code;
+			code += 1;
+		}
+		code <<= 1; // append zero to the end
+	}
+}
+
+// helper class to read bits from a byte vector
+class BitReader {
+public:
+	BitReader(const std::vector<byte>& d) : data(d) {}
+public:
+	// read one bit (0 or 1) or return -1 if all bits have already been read
+	int readBit() {
+		if (nextByte >= data.size()) {
+			return -1;
+		}
+
+		int bit = (data[nextByte] >> (7 - nextBit)) & 1;
+		nextBit += 1;
+
+		if (nextBit == 8) {
+			nextBit = 0;
+			nextByte += 1;
+		}
+
+		return bit;
+	}
+
+	// read a variable number of bits
+	// first read bit is most significant bit
+	// return -1 if at any point all bits have already been read
+	int readBits(const uint32_t length) {
+		int bits = 0;
+		for (uint32_t i = 0; i < length; ++i) {
+			int bit = readBit();
+			if (bit == -1) {
+				bits = -1;
+				break;
+			}
+			bits = (bits << 1) | bit;
+		}
+		return bits;
+	}
+
+	// if there are bits remaining,
+	// advance to the 0th bit of the next byte
+	void align() {
+		if (nextByte >= data.size()) {
+			return;
+		}
+
+		if (nextBit != 0) {
+			nextBit = 0;
+			nextByte += 1;
+		}
+	}
+private:
+	const std::vector<byte>& data;
+	uint32_t nextByte = 0;
+	uint32_t nextBit = 0;
+};
+
+// return the symbol from the Huffman table that corresponds to
+// the next Huffman code read from the BitReader
+byte getNextSymbol(BitReader& br, const HuffmanTable& hTable) {
+	uint32_t currentCode = 0;
+	for (uint32_t i = 0; i < 16; ++i) {
+		int bit = br.readBit();
+		if (bit == -1) {
+			return -1;
+		}
+
+		currentCode = (currentCode << 1) | bit;
+		for (uint32_t j = hTable.offsets[i]; j < hTable.offsets[i + 1]; ++j) {
+			if (currentCode == hTable.codes[j]) {
+				return hTable.symbols[j];
+			}
+		}
+	}
+
+	return -1;
+}
+
+// fill the coefficients of an MCU component based on Huffman codes
+// read from the BitReader
+bool decodeMCUComponent(
+	BitReader& br, 
+	int* const component,
+	int& previousDC,
+	const HuffmanTable& dcTable, 
+	const HuffmanTable& acTable
+) {
+	// get the DC value for this MCU component
+	byte length = getNextSymbol(br, dcTable);
+	if (length == (byte) - 1) {
+		std::cout << "Error - Invalid DC value\n";
+		return false;
+	}
+
+	if (length > 11) {
+		std::cout << "Error - DC coefficient length greater than 11\n";
+		return false;
+	}
+
+	int coeff = br.readBits(length);
+	if (coeff == -1) {
+		std::cout << "Error - Invalid DC value\n";
+		return false;
+	}
+
+	if (length != 0 && coeff < (1 << (length - 1))) {
+		coeff -= (1 << length) - 1;
+	}
+
+	component[0] = coeff + previousDC;
+	previousDC = component[0];
+
+	// get the AC values for this MCU component
+	uint32_t i = 1;
+	while (i < 64) {
+		byte symbol = getNextSymbol(br, acTable);
+		if (symbol == (byte)-1) {
+			std::cout << "Error - Invalid AC value\n";
+			return false;
+		}
+
+		// symbol 0x00 means fill remainder of component with 0
+		if (symbol == 0x00) {
+			for (; i < 64; ++i) {
+				component[zigZagMap[i]] = 0;
+			}
+			return true;
+		}
+
+		// otherwise, read next component coefficient
+		byte numZeroes = symbol >> 4;
+		byte coeffLength = symbol & 0x0F;
+		coeff = 0;
+
+		// symbol 0xF0 means skip 16 0's
+		if (symbol == 0xF0) {
+			numZeroes = 16;
+		}
+
+		if (i + numZeroes >= 64) {
+			std::cout << "Error - Zero run-length exceeded MCU\n";
+			return false;
+		}
+
+		for (uint32_t j = 0; j < numZeroes; ++j, ++i) {
+			component[zigZagMap[i]] = 0;
+		}
+
+		if (coeffLength > 10) {
+			std::cout << "Error - AC coefficient length greater than 10\n";
+			return false;
+		}
+
+		if (coeffLength != 0) {
+			coeff = br.readBits(coeffLength);
+			if (coeff == -1) {
+				std::cout << "Error - Invalid AC value\n";
+				return false;
+			}
+			if (coeff < (1 << (coeffLength - 1))) {
+				coeff -= (1 << coeffLength) - 1;
+			}
+			component[zigZagMap[i]] = coeff;
+			i += 1;
+		}
+	}
+	return true;
+}
+
+// decode all the Huffman data and fill all MCUs
+MCU* decodeHuffmanData(Header* const header) {
+	const uint32_t mcuHeight = (header->height + 7) / 8;
+	const uint32_t mcuWidth = (header->width + 7) / 8;
+	const uint32_t mcuMCUs = mcuHeight * mcuWidth;
+	MCU* mcus = new (std::nothrow) MCU[mcuMCUs];
+
+	if (mcus == nullptr) {
+		std::cout << "Error - Memory error\n";
+		return nullptr;
+	}
+	
+	for (uint32_t i = 0; i < 4; ++i) {
+		if (header->huffmanDCTables[i].set) {
+			generateCodes(header->huffmanDCTables[i]);
+		}
+
+		if (header->huffmanACTables[i].set) {
+			generateCodes(header->huffmanACTables[i]);
+		}
+	}
+
+	BitReader br(header->huffmanData);
+
+	int previousDCs[3] = { 0 };
+
+	for (uint32_t i = 0; i < mcuMCUs; ++i) {
+		if (header->restartInterval != 0 && i % header->restartInterval == 0) {
+			previousDCs[0] = 0;
+			previousDCs[1] = 0;
+			previousDCs[2] = 0;
+			br.align();
+		}
+
+		for (uint32_t j = 0; j < header->numComponents; ++j) {
+			if (!decodeMCUComponent(
+				br, 
+				mcus[i][j],
+				previousDCs[j],
+				header->huffmanDCTables[header->colorComponents[j].huffmanDCTableID],
+				header->huffmanACTables[header->colorComponents[j].huffmanACTableID]
+			)) {
+				delete[] mcus;
+				return nullptr;
+			}
+		}
+	}
+
+	return mcus;
+}
+
+// helper function to write a 4-byte integer in little-endian
+void putInt(std::ofstream& file, const uint32_t v) {
+	file.put((v >> 0) & 0xFF);
+	file.put((v >> 8) & 0xFF);
+	file.put((v >> 16) & 0xFF);
+	file.put((v >> 24) & 0xFF);
+}
+
+// helper function to write a 2-byte short integer in little-endian
+void putShort(std::ofstream& file, const uint32_t v) {
+	file.put((v >> 0) & 0xFF);
+	file.put((v >> 8) & 0xFF);
+}
+
+// write all the pixels in the MCUs to a BMP file
+void writeBMP(const Header* const header, const MCU* const mcus, const std::string& filename) {
+	std::ofstream file = std::ofstream(filename, std::ios::out | std::ios::binary);
+	if (!file.is_open()) {
+		std::cout << "Error - Error opening output file\n";
+		return;
+	}
+
+	const uint32_t mcuHeight = (header->height + 7) / 8;
+	const uint32_t mcuWidth = (header->width + 7) / 8;
+	const uint32_t paddingSize = header->width % 4;
+	const uint32_t size = 14 + 12 + header->height * header->width * 3 + paddingSize * header->height;
+
+	file.put('B');
+	file.put('M');
+	putInt(file, size);
+	putInt(file, 0);
+	putInt(file, 0x1A);
+	putInt(file, 12);
+	putShort(file, header->width);
+	putShort(file, header->height);
+	putShort(file, 1);
+	putShort(file, 24);
+
+	for (int32_t y = static_cast<int32_t>(header->height) - 1; y >= 0; --y) {
+		const uint32_t mcuRow = y / 8;
+		const uint32_t pixelRow = y % 8;
+		for (uint32_t x = 0; x < header->width; ++x) {
+			const uint32_t mcuColumn = x / 8;
+			const uint32_t pixelColumn = x % 8;
+			const uint32_t mcuIndex = mcuRow * mcuWidth + mcuColumn;
+			const uint32_t pixelIndex = pixelRow * 8 + pixelColumn;
+			
+			file.put(mcus[mcuIndex].b[pixelIndex]);
+			file.put(mcus[mcuIndex].g[pixelIndex]);
+			file.put(mcus[mcuIndex].r[pixelIndex]);
+		}
+
+		for (uint32_t i = 0; i < paddingSize; ++i) {
+			file.put(0);
+		}
+	}
+
+	file.close();
+}
+
 int main(int argc, char** argv) {
 	if (argc < 2) {
 		std::cout << "Error - Invalid arguments\n";
@@ -578,6 +869,19 @@ int main(int argc, char** argv) {
 
 		printHeader(header);
 
+		// decode Huffman data
+		MCU* mcus = decodeHuffmanData(header);
+		if (mcus == nullptr) {
+			delete header;
+			continue;
+		}
+
+		// write BMP file
+		const size_t pos = filename.find_last_of('.');
+		const std::string outFilename = (pos == std::string::npos) ? (filename + ".bmp") : (filename.substr(0, pos) + ".bmp");
+		writeBMP(header, mcus, outFilename);
+
+		delete[] mcus;
 		delete header;
 	}
 
