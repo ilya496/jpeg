@@ -787,6 +787,26 @@ MCU* decodeHuffmanData(Header* const header) {
 	return mcus;
 }
 
+// dequantize an MCU component based on a quantization table
+void dequantizeMCUComponent(const QuantizationTable& qTable, int* const component) {
+	for (uint32_t i = 0; i < 64; ++i) {
+		component[i] *= qTable.table[i];
+	}
+}
+
+// dequantize all MCUs
+void dequantize(const Header* const header, MCU* const mcus) {
+	const uint32_t mcuHeight = (header->height + 7) / 8;
+	const uint32_t mcuWidth = (header->width + 7) / 8;
+	const uint32_t mcuMCUs = mcuHeight * mcuWidth;
+
+	for (uint32_t i = 0; i < mcuMCUs; ++i) {
+		for (uint32_t j = 0; j < header->numComponents; ++j) {
+			dequantizeMCUComponent(header->quantizationTables[header->colorComponents[j].quantizationTableID], mcus[i][j]);
+		}
+	}
+}
+
 // helper function to write a 4-byte integer in little-endian
 void putInt(std::ofstream& file, const uint32_t v) {
 	file.put((v >> 0) & 0xFF);
@@ -875,6 +895,9 @@ int main(int argc, char** argv) {
 			delete header;
 			continue;
 		}
+
+		// dequantize MCU coefficients
+		dequantize(header, mcus); 
 
 		// write BMP file
 		const size_t pos = filename.find_last_of('.');
